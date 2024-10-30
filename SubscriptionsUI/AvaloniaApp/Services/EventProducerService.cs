@@ -32,11 +32,11 @@ public sealed class EventProducerService : IDisposable {
 	}
 
 	public void Start() {
-		if (_cts is not null) {
-			_cts.Cancel();
+		if (_cts is null) {
 			_cts = new();
 		}
 
+		Messages?.Clear();
 		SubscriberMessages?.Clear();
 		Task.Factory.StartNew(DoWork, _cts!.Token);
 	}
