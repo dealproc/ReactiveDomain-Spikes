@@ -24,7 +24,11 @@ public sealed class EventProducerService : IDisposable {
 	public EventProducerService(IStreamStoreConnection streamStoreConnection, ILoggerFactory loggerFactory) {
 		_streamStoreConnection = streamStoreConnection;
 		_log = loggerFactory.CreateLogger<EventProducerService>();
-		_disposables.Add(_streamStoreConnection.SubscribeToStream(SimpleMessage.StreamName, (e) => {
+		_disposables.Add(_streamStoreConnection.SubscribeToStreamFrom(
+			SimpleMessage.StreamName, 
+			-1,
+			CatchUpSubscriptionSettings.Default,
+			(e) => {
 			_log.LogInformation("Received message off of a subscription.");
 			var msg = JsonSerializer.Deserialize<SimpleMessage>(new MemoryStream(e.Data))!;
 			SubscriberMessages.Add(msg);

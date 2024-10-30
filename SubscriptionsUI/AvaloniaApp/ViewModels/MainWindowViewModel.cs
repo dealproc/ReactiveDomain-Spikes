@@ -16,6 +16,7 @@ namespace AvaloniaApp.ViewModels;
 public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 	private readonly ILogger _log;
 	private readonly EventProducerService _eps;
+	private readonly UsingReadModel _usingReadModel;
 
 	private readonly List<IDisposable> _disposables = [];
 
@@ -25,16 +26,20 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 	public ReadOnlyObservableCollection<SimpleMessage>? _subscriberMessages;
 	public ReadOnlyObservableCollection<SimpleMessage>? SubscriberMessages => _subscriberMessages;
 
+	public ReadOnlyObservableCollection<string>? _fromReadModel;
+	public ReadOnlyObservableCollection<string>? FromReadModel => _fromReadModel;
+
 #pragma warning disable CA1822 // Mark members as static
 	public string Greeting => "Welcome to Avalonia!";
 #pragma warning restore CA1822 // Mark members as static
 
 
-	public MainWindowViewModel(ILoggerFactory loggerFactory, EventProducerService eps) {
+	public MainWindowViewModel(ILoggerFactory loggerFactory, EventProducerService eps, UsingReadModel usingReadModel) {
 		_log = loggerFactory.CreateLogger<MainWindowViewModel>();
 		_log.LogInformation("Constructed Main Window View Model.");
 
 		_eps = eps;
+		_usingReadModel = usingReadModel;
 
 		ConstructCommonElements();
 	}
@@ -50,10 +55,12 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 		StartService = ReactiveCommand.Create(() => {
 			var x = 0;
 			_eps.Start();
+			_usingReadModel.Start();
 		});
 		StopService = ReactiveCommand.Create(() => {
 			var x = 0;
 			_eps.Stop();
+			_usingReadModel.Stop();
 		});
 
 		if (_eps is not null) {
@@ -65,13 +72,17 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 				_eps.SubscriberMessages
 					.ToObservableChangeSet(x => x.Message)
 					.Bind(out _subscriberMessages)
+					.Subscribe(),
+				_usingReadModel.Notifications
+					.ToObservableChangeSet(x => x)
+					.Bind(out _fromReadModel)
 					.Subscribe()
 			]);
 		}
 	}
 
 	public void Dispose() {
-		foreach(var d in _disposables) {
+		foreach (var d in _disposables) {
 			d?.Dispose();
 		}
 		_disposables.Clear();
