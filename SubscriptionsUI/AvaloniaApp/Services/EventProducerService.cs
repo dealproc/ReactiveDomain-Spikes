@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AvaloniaApp.Models;
+using Microsoft.Extensions.Logging;
 using ReactiveDomain;
 
 namespace AvaloniaApp.Services;
@@ -13,15 +14,18 @@ namespace AvaloniaApp.Services;
 public sealed class EventProducerService : IDisposable {
 	private readonly IStreamStoreConnection _streamStoreConnection;
 	private readonly List<IDisposable> _disposables = [];
+	private readonly ILogger _log;
 
 	CancellationTokenSource _cts = new();
 
 	public ObservableCollection<SimpleMessage> Messages { get; } = [];
 	public ObservableCollection<SimpleMessage> SubscriberMessages { get; } = [];
 
-	public EventProducerService(IStreamStoreConnection streamStoreConnection) {
+	public EventProducerService(IStreamStoreConnection streamStoreConnection, ILoggerFactory loggerFactory) {
 		_streamStoreConnection = streamStoreConnection;
+		_log = loggerFactory.CreateLogger<EventProducerService>();
 		_disposables.Add(_streamStoreConnection.SubscribeToStream(SimpleMessage.StreamName, (e) => {
+			_log.LogInformation("Received message off of a subscription.");
 			var msg = JsonSerializer.Deserialize<SimpleMessage>(new MemoryStream(e.Data))!;
 			SubscriberMessages.Add(msg);
 		}));
