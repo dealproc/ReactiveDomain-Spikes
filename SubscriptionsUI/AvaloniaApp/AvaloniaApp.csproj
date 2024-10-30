@@ -25,4 +25,8 @@
     <PackageReference Include="ReactiveDomain.EventStore.Embedded" Version="0.3.0" />
     <PackageReference Include="ReactiveUI" Version="20.1.63" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LocalDataStore\LocalDataStore.csproj" />
+  </ItemGroup>
 </Project>

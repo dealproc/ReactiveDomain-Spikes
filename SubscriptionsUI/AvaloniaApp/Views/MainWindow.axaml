@@ -41,6 +41,18 @@
 			</ItemsControl>
 		</StackPanel>
 
+		<StackPanel Grid.Row="0"
+					Grid.Column="1">
+			<ItemsControl ItemsSource="{Binding SubscriberMessages}"
+						  x:DataType="vm:MainWindowViewModel">
+				<ItemsControl.ItemTemplate>
+					<DataTemplate  x:DataType="m:SimpleMessage">
+						<TextBlock Text="{Binding Message}" />
+					</DataTemplate>
+				</ItemsControl.ItemTemplate>
+			</ItemsControl>
+		</StackPanel>
+
 		<TextBlock Text="{Binding Greeting}"
 				   Grid.Row="1"
 				   Grid.Column="0"

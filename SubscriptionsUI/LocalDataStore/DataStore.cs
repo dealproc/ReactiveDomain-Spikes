@@ -1,0 +1,582 @@
+﻿using EventStore.ClientAPI.Exceptions;
+using ReactiveDomain;
+using ReactiveDomain.Messaging;
+using ReactiveDomain.Messaging.Bus;
+using ReactiveDomain.Util;
+using WrongExpectedVersionException = ReactiveDomain.WrongExpectedVersionException;
+#nullable disable
+// ReSharper disable MemberCanBePrivate.Global
+namespace PowerModels.Persistence {
+	public interface IStream : IReadOnlyList<RecordedEvent> {
+		public RecordedEvent Add(RecordedEvent re);
+	}
+	public sealed class DataStore : IStreamStoreConnection {
+		public const string CategoryStreamNamePrefix = @"$ce";
+		public const string EventTypeStreamNamePrefix = @"$et";
+		public const string AllStreamName = @"$All";
+		private readonly Dictionary<string, IStream> _store;
+		private readonly IStream _allStream;
+		private readonly QueuedHandler _inboundEventHandler;
+		private readonly IBus _inboundEventBus;
+		private readonly List<IDisposable> _subscriptions;
+		private bool _connected;
+		private bool _disposed;
+#nullable enable
+		public DataStore(string name, string? persistentStorePath = null) {
+			_subscriptions = new List<IDisposable>();
+			_allStream = persistentStorePath != null ? new PersistentAllStream(persistentStorePath) : new Stream();
+			_store = new Dictionary<string, IStream> { { AllStreamName, _allStream } };
+			foreach (var e in _allStream) {
+				string streamId;
+				if (e is ProjectedEvent pe) {
+					streamId = pe.ProjectedStream;
+				} else {
+					streamId = e.EventStreamId;
+				}
+				if (!_store.TryGetValue(streamId, out var stream)) {
+					stream = new Stream();
+					_store.Add(streamId, stream);
+				}
+
+				stream.Add(e);
+			}
+			_inboundEventBus = new InMemoryBus(nameof(_inboundEventBus), false);
+			_subscriptions.Add(_inboundEventBus.Subscribe(new AdHocHandler<EventWritten>(WriteToByCategoryProjection)));
+			_subscriptions.Add(_inboundEventBus.Subscribe(new AdHocHandler<EventWritten>(WriteToByEventProjection)));
+
+			_inboundEventHandler = new QueuedHandler(
+				new AdHocHandler<IMessage>(_inboundEventBus.Publish),
+				nameof(_inboundEventHandler),
+				false);
+			_inboundEventHandler.Start();
+			ConnectionName = name;
+		}
+#nullable disable
+
+		public string ConnectionName { get; }
+
+		public void Connect() {
+			_connected = true;
+		}
+
+		public void Close() {
+			_connected = false;
+			_subscriptions.ForEach(s => s?.Dispose());
+		}
+
+		public event EventHandler<ClientConnectionEventArgs> Connected = (p1, p2) => { };
+		public event EventHandler<ClientConnectionEventArgs> Disconnected = (p1, p2) => { };
+
+		public WriteResult AppendToStream(
+			string stream,
+			long expectedVersion,
+			UserCredentials credentials = null,
+			params EventData[] events) {
+
+			if (!_connected)
+				throw new Exception("Not Connected");
+			if (_disposed)
+				throw new ObjectDisposedException(nameof(DataStore));
+			if (string.IsNullOrWhiteSpace(stream))
+				throw new ArgumentNullException(nameof(stream), $"{nameof(stream)} cannot be null or whitespace");
+
+			IStream eventStream;
+			if (expectedVersion == ExpectedVersion.Any) {
+				eventStream = GetOrCreateStream(stream);
+			} else {
+				bool streamExists;
+				lock (_store) {
+					streamExists = _store.TryGetValue(stream, out eventStream);
+				}
+
+				if (streamExists && expectedVersion == ExpectedVersion.NoStream)
+					throw new WrongExpectedVersionException($"Stream {stream} exists, expected no stream");
+				if (!streamExists && (expectedVersion == ExpectedVersion.StreamExists))
+					throw new WrongExpectedVersionException($"Stream {stream} does not exist, expected stream");
+
+				if (!streamExists) {
+					eventStream = new Stream();
+					lock (_store) {
+						_store.Add(stream, eventStream);
+					}
+				}
+				var startingPosition = eventStream.Count - 1;
+				if (expectedVersion != ExpectedVersion.NoStream &&
+					expectedVersion != startingPosition)
+					throw new WrongExpectedVersionException(
+						$"Stream {stream} at position {eventStream.Count} expected {expectedVersion}.");
+			}
+			var epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+			for (var i = 0; i < events.Length; i++) {
+				var created = DateTime.UtcNow;
+				var epochTime = (long)(created - epochStart).TotalSeconds;
+				var recordedEvent = new RecordedEvent(
+					stream,
+					events[i].EventId,
+					eventStream.Count,
+					events[i].EventType,
+					events[i].Data,
+					events[i].Metadata,
+					events[i].IsJson,
+					created,
+					epochTime);
+				lock (_allStream) {
+					_allStream.Add(recordedEvent);
+					_inboundEventHandler.Handle(new EventCommitted(recordedEvent, _allStream.Count));
+
+				}
+
+				eventStream.Add(recordedEvent);
+				_inboundEventHandler.Handle(new EventWritten(stream, recordedEvent, false, recordedEvent.EventNumber));
+			}
+			return new WriteResult(eventStream.Count - 1);
+
+		}
+
+		/// <summary>
+		/// Get or Create the By-Category projection Stream for Category
+		/// </summary>
+		/// <remarks>
+		/// <see href="https://eventstore.org/docs/projections/system-projections/index.html"/>
+		/// The category stream name is generated by spiting the event stream at the first dash. This is the default 
+		/// configuration setting (prefix (a category) by splitting a stream id by a configurable separator.)
+		/// </remarks>
+		/// <param name="event">Original event whose name is in the aggregate-GUID format</param>
+		/// <param name="streamName">the generated name for the stream</param>
+		/// <returns>categoryStreamName: string</returns>
+		private IStream GetOrCreateCategoryStream(EventWritten @event, out string streamName) {
+			var category = @event.StreamName.Split('-')[0];
+			streamName = $"{CategoryStreamNamePrefix}-{category}";
+			return GetOrCreateStream(streamName);
+		}
+
+		/// <summary>
+		/// Get or Create the EventType Projection Stream for Event Type
+		/// </summary>
+		/// <remarks>
+		/// <see href="https://eventstore.org/docs/projections/system-projections/index.html"/>
+		/// The event stream name is generated from the event type. In the event store, this is not configurable.
+		/// </remarks>
+		/// <param name="event">Original event whose name is in the aggregate-GUID format</param>
+		/// <param name="streamName">the generated name for the stream</param>
+		/// <returns>eventStreamName: string</returns>
+		private IStream GetOrCreateEventTypeStream(EventWritten @event, out string streamName) {
+			streamName = $"{EventTypeStreamNamePrefix}-{@event.Event.EventType}";
+			return GetOrCreateStream(streamName);
+		}
+		private IStream GetOrCreateStream(string streamName) {
+			IStream stream;
+			lock (_store) {
+				if (!_store.TryGetValue(streamName, out stream)) {
+					stream = new Stream();
+					_store.Add(streamName, stream);
+				}
+			}
+			return stream;
+		}
+		public StreamEventsSlice ReadStreamForward(
+									string streamName,
+									long start,
+									long count,
+									UserCredentials credentials = null) {
+			if (start < 0)
+				throw new ArgumentOutOfRangeException($"{nameof(start)} must be positive.");
+			IStream stream;
+			lock (_store) {
+				if (!_store.ContainsKey(streamName)) { return new StreamNotFoundSlice(streamName); }
+				stream = _store[streamName];
+			}
+			return ReadFromStream(streamName, start, count, stream, ReadDirection.Forward);
+		}
+		public StreamEventsSlice ReadStreamBackward(
+									string streamName,
+									long start,
+									long count,
+									UserCredentials credentials = null) {
+			if (start < -1)
+				throw new ArgumentOutOfRangeException($"{nameof(start)} must be non-negative or -1 for reading from the end of the stream.");
+			IStream stream;
+			lock (_store) {
+				if (!_store.ContainsKey(streamName)) { return new StreamNotFoundSlice(streamName); }
+				stream = _store[streamName];
+			}
+			return ReadFromStream(streamName, start, count, stream, ReadDirection.Backward);
+		}
+		private StreamEventsSlice ReadFromStream(
+									string streamName,
+									long start,
+									long count,
+									IStream stream,
+									ReadDirection direction) {
+			var result = new List<RecordedEvent>();
+			var next = start == -1 ? stream.Count - 1 : (int)start;
+			for (int i = 0; i < count; i++) {
+				if (next < stream.Count && next >= 0) {
+					long current = next;
+					result.Add(stream[(int)current]);
+				}
+				next += (int)direction;
+			}
+
+			bool isEnd;
+
+			if (direction == ReadDirection.Forward) {
+				isEnd = next >= stream.Count;
+				if (next > stream.Count) {
+					next = stream.Count;
+				}
+			} else {
+				isEnd = next < 0;
+				if (next < 0) {
+					next = StreamPosition.End;
+				}
+				if (next > stream.Count + 1) {
+					next = stream.Count - 1;
+				} else if (next > stream.Count) {
+					next = stream.Count;
+				}
+			}
+			var slice = new StreamEventsSlice(
+								streamName,
+								start,
+								direction,
+								result.ToArray(),
+								next,
+								stream.Count - 1,
+								isEnd);
+
+			return slice;
+		}
+
+		public sealed class AllStreamSubscription :
+			IHandle<EventCommitted>,
+			IDisposable {
+			private long _position;
+			private readonly Action<SubscriptionDropReason, Exception> _subscriptionDropped;
+			private readonly Action<RecordedEvent> _eventAppeared;
+			public IDisposable BusSubscription;
+
+			public AllStreamSubscription(
+				long startPosition,
+				Action<SubscriptionDropReason, Exception> subscriptionDropped,
+				Action<RecordedEvent> eventAppeared) {
+				_position = startPosition;
+				_subscriptionDropped = subscriptionDropped;
+				_eventAppeared = eventAppeared;
+			}
+			public void Handle(EventCommitted evt) {
+				if (evt.RecordedPosition > _position) {
+					_position = evt.RecordedPosition;
+					_eventAppeared(evt.Event);
+				}
+			}
+			private bool _disposed;
+			public void Dispose() {
+				if (_disposed)
+					return;
+				_disposed = true;
+				_subscriptionDropped?.Invoke(SubscriptionDropReason.UserInitiated, null);
+				BusSubscription?.Dispose();
+			}
+		}
+		public sealed class Subscription :
+			IHandle<EventWritten>,
+			IDisposable {
+			private readonly string _streamName;
+			private long _position;
+			private readonly Action<SubscriptionDropReason, Exception> _subscriptionDropped;
+			private readonly Action<RecordedEvent> _eventAppeared;
+			public IDisposable BusSubscription;
+
+			public Subscription(
+				string streamName,
+				long startPosition,
+				Action<SubscriptionDropReason, Exception> subscriptionDropped,
+				Action<RecordedEvent> eventAppeared) {
+				_streamName = streamName;
+				_position = startPosition;
+				_subscriptionDropped = subscriptionDropped;
+				_eventAppeared = eventAppeared;
+			}
+			public void Handle(EventWritten evt) {
+				if (string.CompareOrdinal(_streamName, evt.StreamName) == 0 ||
+					string.CompareOrdinal(_streamName, AllStreamName) == 0) {
+					if (evt.RecordedPosition > _position) {
+						_position = evt.RecordedPosition;
+						_eventAppeared(evt.Event);
+					}
+				}
+			}
+			private bool _disposed;
+			public void Dispose() {
+				if (_disposed)
+					return;
+				_disposed = true;
+				_subscriptionDropped?.Invoke(SubscriptionDropReason.UserInitiated, null);
+				BusSubscription?.Dispose();
+			}
+		}
+
+		public IDisposable SubscribeToStream(
+			string stream,
+			Action<RecordedEvent> eventAppeared,
+			Action<SubscriptionDropReason, Exception> subscriptionDropped = null,
+			UserCredentials userCredentials = null) {
+			long currentPos = 0;
+			lock (_store) {
+				if (_store.ContainsKey(stream)) {
+					currentPos = _store[stream].Count - 1;
+				}
+			}
+
+			return SubscribeToStreamFrom(
+				stream,
+				currentPos,
+				CatchUpSubscriptionSettings.Default,
+				eventAppeared,
+				null, //live processing started
+				subscriptionDropped,
+				userCredentials);
+		}
+		public IDisposable SubscribeToStreamFrom(
+			string stream,
+			long? lastCheckpoint,
+			CatchUpSubscriptionSettings settings,
+			Action<RecordedEvent> eventAppeared,
+			Action<Unit> liveProcessingStarted = null,
+			Action<SubscriptionDropReason, Exception> subscriptionDropped = null,
+			UserCredentials userCredentials = null) {
+
+			var start = (lastCheckpoint ?? -1) + 1;
+			RecordedEvent[] curEvents = { };
+			lock (_store) {
+				if (_store.ContainsKey(stream)) {
+					curEvents = _store[stream].Skip((int)start).ToArray();
+				}
+			}
+			while (curEvents.Length > 0) {
+				for (int i = 0; i < curEvents.Length; i++) {
+					eventAppeared(curEvents[i]);
+				}
+
+				start = start + curEvents.Length;
+				lock (_store) {
+					curEvents = _store[stream].Skip((int)start).ToArray();
+				}
+			}
+			//n.b. this leaves a possible gap in the events at switchover, #mock-life
+
+
+
+			var subscription = new Subscription(stream, start - 1, subscriptionDropped, eventAppeared);
+			subscription.BusSubscription = _inboundEventBus.Subscribe(subscription);
+			_subscriptions.Add(subscription);
+			liveProcessingStarted?.Invoke(Unit.Default);
+			return subscription;
+
+		}
+
+
+
+
+		public IDisposable SubscribeToAllFrom(Position @from, Action<RecordedEvent> eventAppeared, CatchUpSubscriptionSettings settings = null,
+											  Action liveProcessingStarted = null, Action<SubscriptionDropReason, Exception> subscriptionDropped = null,
+											  UserCredentials userCredentials = null, bool resolveLinkTos = true) {
+			var current = (int)@from.CommitPosition;
+			lock (_allStream) {
+				if (@from == Position.End) {
+					current = _allStream.Count - 1;
+				}
+			}
+
+			for (int i = 0; i < _allStream.Count; i++) {
+				eventAppeared(_allStream[i]);
+			}
+
+			var subscription = new AllStreamSubscription(current, subscriptionDropped, eventAppeared);
+			subscription.BusSubscription = _inboundEventBus.Subscribe(subscription);
+			_subscriptions.Add(subscription);
+			liveProcessingStarted?.Invoke();
+			return subscription;
+
+		}
+
+		public IDisposable SubscribeToAll(
+								Action<RecordedEvent> eventAppeared,
+								Action<SubscriptionDropReason, Exception> subscriptionDropped = null,
+								UserCredentials userCredentials = null,
+								bool resolveLinkTos = true) {
+			return SubscribeToAllFrom(
+				Position.Start,
+				eventAppeared,
+				null,
+				null,
+				subscriptionDropped,
+				userCredentials);
+		}
+
+		public void DeleteStream(string stream, long expectedVersion, UserCredentials credentials = null) {
+			if (stream.StartsWith(CategoryStreamNamePrefix, StringComparison.OrdinalIgnoreCase) ||
+			   stream.StartsWith(EventTypeStreamNamePrefix, StringComparison.OrdinalIgnoreCase)) {
+				throw new ArgumentOutOfRangeException(nameof(stream), $"Deleting {stream} failed. Cannot delete standard projection streams");
+			}
+			if (stream.StartsWith("$")) {
+				throw new AggregateException(new AccessDeniedException($"Write permission denied for {stream}."));
+			}
+			lock (_store) {
+				if (_store.ContainsKey(stream)) {
+					_store.Remove(stream);
+				}
+				if (expectedVersion == ExpectedVersion.StreamExists) {
+					throw new ArgumentOutOfRangeException(nameof(expectedVersion));
+				}
+			}
+		}
+
+		public void HardDeleteStream(string stream, long expectedVersion, UserCredentials credentials = null) {
+			if (stream.StartsWith(CategoryStreamNamePrefix, StringComparison.OrdinalIgnoreCase) ||
+			   stream.StartsWith(EventTypeStreamNamePrefix, StringComparison.OrdinalIgnoreCase)) {
+				throw new ArgumentOutOfRangeException(nameof(stream), $"Hard deleting {stream} failed. Cannot hard delete standard projection streams");
+			}
+			if (stream.StartsWith("$")) {
+				throw new AggregateException(new AccessDeniedException($"Write permission denied for {stream}."));
+			}
+			lock (_store) {
+				if (_store.ContainsKey(stream)) {
+					_store.Remove(stream);
+				}
+				if (expectedVersion == ExpectedVersion.StreamExists) {
+					throw new ArgumentOutOfRangeException(nameof(expectedVersion));
+				}
+			}
+		}
+
+		/// <summary>
+		/// Write to the Category Stream
+		/// </summary>
+		/// <remarks>
+		/// If the category stream doesn't exist, create it.
+		/// The data in the event parameter includes the original stream, the recorded event, and messageId.
+		/// <seealso cref="EventWritten"/>
+		/// Generate the name from the original stream. <see cref="GetOrCreateCategoryStream"/>
+		/// The caller sets up the Category Stream, append the events."/>
+		/// </remarks>
+		/// <param name="event">Event to be written to the category stream</param>
+		private void WriteToByCategoryProjection(EventWritten @event) {
+			if (!_connected || _disposed)
+				throw new Exception();
+			if (@event.ProjectedEvent) { return; }
+			var stream = GetOrCreateCategoryStream(@event, out var streamName);
+			var epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+			var created = DateTime.UtcNow;
+			var epochTime = (long)(created - epochStart).TotalSeconds;
+
+			var projectedEvent = new ProjectedEvent(
+					streamName,
+					@event.Event.EventNumber,
+					@event.Event.EventStreamId,
+					@event.Event.EventId, // reusing since the projection is linking to the original event
+					stream.Count,
+					@event.Event.EventType,
+					@event.Event.Data,
+					@event.Event.Metadata,
+					@event.Event.IsJson,
+					created,
+					epochTime);
+			lock (_allStream) {
+				_allStream.Add(projectedEvent);
+				_inboundEventHandler.Handle(new EventCommitted(projectedEvent, _allStream.Count));
+			}
+
+			stream.Add(projectedEvent);
+
+			_inboundEventHandler.Handle(new EventWritten(streamName, projectedEvent, true, projectedEvent.EventNumber));
+		}
+
+		/// <summary>
+		/// Write to the Event Stream
+		/// </summary>
+		/// <remarks>
+		/// If the event stream doesn't exist, create it.
+		/// The data in the event parameter includes the original stream, the recorded event, and messageId.
+		/// <seealso cref="EventWritten"/>
+		/// Generate the name from the event type passed in the original stream. <see cref="GetOrCreateEventTypeStream"/>
+		/// The caller sets up the Event Stream, append the events."/>
+		/// </remarks>
+		/// <param name="event">Event to be written to the event stream</param>
+		private void WriteToByEventProjection(EventWritten @event) {
+			if (!_connected || _disposed)
+				throw new Exception();
+			if (@event.ProjectedEvent) { return; }
+			var stream = GetOrCreateEventTypeStream(@event, out var streamName);
+			var epochStart = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+			var created = DateTime.UtcNow;
+			var epochTime = (long)(created - epochStart).TotalSeconds;
+
+			var projectedEvent = new ProjectedEvent(
+				streamName,
+				@event.Event.EventNumber,
+				@event.Event.EventStreamId,
+				@event.Event.EventId, // reusing since the projection is linking to the original event
+				stream.Count,
+				@event.Event.EventType,
+				@event.Event.Data,
+				@event.Event.Metadata,
+				@event.Event.IsJson,
+				created,
+				epochTime);
+			lock (_allStream) {
+				_allStream.Add(projectedEvent);
+				_inboundEventHandler.Handle(new EventCommitted(projectedEvent, _allStream.Count));
+			}
+			stream.Add(projectedEvent);
+			_inboundEventHandler.Handle(new EventWritten(streamName, projectedEvent, true, projectedEvent.EventNumber));
+		}
+
+
+		public void Dispose() {
+			if (_disposed)
+				return;
+			_disposed = true;
+			Close();
+			_subscriptions?.ForEach(s => s?.Dispose());
+			_inboundEventHandler?.Stop();
+			if (_allStream is PersistentAllStream pas) {
+				pas.Dispose();
+			}
+		}
+
+		public class EventWritten : IMessage {
+			public Guid MsgId { get; private set; }
+			public readonly string StreamName;
+			public readonly RecordedEvent Event;
+			public readonly bool ProjectedEvent;
+			public readonly long RecordedPosition;
+
+			public EventWritten(
+				string streamName,
+				RecordedEvent @event,
+				bool projectedEvent,
+				long recordedPosition) {
+				MsgId = Guid.NewGuid();
+				StreamName = streamName;
+				Event = @event;
+				ProjectedEvent = projectedEvent;
+				RecordedPosition = recordedPosition;
+			}
+		}
+		public class EventCommitted : IMessage {
+			public Guid MsgId { get; private set; }
+			public readonly RecordedEvent Event;
+			public readonly long RecordedPosition;
+
+			public EventCommitted(
+				RecordedEvent @event,
+				long recordedPosition) {
+				MsgId = Guid.NewGuid();
+				RecordedPosition = recordedPosition;
+				Event = @event;
+			}
+		}
+	}
+}

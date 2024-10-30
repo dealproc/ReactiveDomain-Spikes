@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Reactive;
 using System.Reactive.Linq;
@@ -16,10 +17,13 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 	private readonly ILogger _log;
 	private readonly EventProducerService _eps;
 
-	private IDisposable? _messagesSubscriber;
+	private readonly List<IDisposable> _disposables = [];
+
 	private ReadOnlyObservableCollection<SimpleMessage>? _messages;
 	public ReadOnlyObservableCollection<SimpleMessage>? Messages => _messages;
 
+	public ReadOnlyObservableCollection<SimpleMessage>? _subscriberMessages;
+	public ReadOnlyObservableCollection<SimpleMessage>? SubscriberMessages => _subscriberMessages;
 
 #pragma warning disable CA1822 // Mark members as static
 	public string Greeting => "Welcome to Avalonia!";
@@ -53,15 +57,24 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable {
 		});
 
 		if (_eps is not null) {
-			_messagesSubscriber = _eps.Messages
-				.ToObservableChangeSet(x => x.Message)
-				.Bind(out _messages)
-				.Subscribe();
+			_disposables.AddRange([
+				_eps.Messages
+					.ToObservableChangeSet(x => x.Message)
+					.Bind(out _messages)
+					.Subscribe(),
+				_eps.SubscriberMessages
+					.ToObservableChangeSet(x => x.Message)
+					.Bind(out _subscriberMessages)
+					.Subscribe()
+			]);
 		}
 	}
 
 	public void Dispose() {
-		_messagesSubscriber?.Dispose();
+		foreach(var d in _disposables) {
+			d?.Dispose();
+		}
+		_disposables.Clear();
 	}
 
 	public ReactiveCommand<Unit, Unit> StartService { get; private set; } = null!;

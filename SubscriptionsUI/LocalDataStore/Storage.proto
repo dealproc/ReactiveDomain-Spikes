@@ -1,0 +1,32 @@
+﻿syntax = "proto3";
+
+package forcaster.persistence;
+
+option csharp_namespace = "PowerModels.Persistence";
+
+import "google/protobuf/timestamp.proto";
+
+message StorageMessage{
+	oneof type {
+		ProjectionInfo projectedEvent = 1;
+	}
+	string streamId = 2;
+	Uuid eventId = 3;
+	int64 eventNumber = 4;
+	string eventType = 5;
+	bytes data = 6;
+	bytes metadata = 7;
+	bool isJson = 8;
+	google.protobuf.Timestamp created = 9;
+	int64 createdEpoch = 10;
+}
+
+message ProjectionInfo{
+	string projectedStream = 1;
+	int64 originalEventNumber = 2;
+}
+
+message Uuid {
+  int64 most_significant_bits = 1;
+  int64 least_significant_bits = 2;
+}

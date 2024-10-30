@@ -3,6 +3,7 @@ using EventStore.Embedded;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using PowerModels.Persistence;
 using ReactiveDomain;
 
 namespace AvaloniaApp;
@@ -33,7 +34,12 @@ public static class DI {
 			services.AddSingleton<IStreamStoreConnection>((sp) => {
 				var metrics = Configuration.GetSection("metrics");
 				var scc = SingleVNodeClient.CreateInMem(sp.GetRequiredService<ILoggerFactory>().CreateLogger<SingleVNodeClient>(), sp.GetRequiredService<ILoggerFactory>(), metrics);
+				scc.ConnectAsync().Wait();
 				return scc;
+
+				//var lds = new DataStore("...");
+				//lds.Connect();
+				//return lds;
 			});
 			services.AddSingleton<EventProducerService>();
 
