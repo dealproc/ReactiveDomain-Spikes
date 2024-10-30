@@ -29,7 +29,7 @@ public static class DI {
 			}
 
 			var services = new ServiceCollection();
-			services.AddLogging();
+			services.AddLogging(l => l.AddDebug());
 			services.AddSingleton<IStreamStoreConnection>((sp) => {
 				var metrics = Configuration.GetSection("metrics");
 				var scc = SingleVNodeClient.CreateInMem(sp.GetRequiredService<ILoggerFactory>().CreateLogger<SingleVNodeClient>(), sp.GetRequiredService<ILoggerFactory>(), metrics);
