@@ -38,7 +38,7 @@ public sealed class EventProducerService : IDisposable {
 	}
 
 	public void Stop() {
-		_cts?.Cancel();
+		_cts?.Cancel(false);
 		_cts = null!;
 	}
 
@@ -55,7 +55,11 @@ public sealed class EventProducerService : IDisposable {
 				Messages.Add(msg);
 			}
 
-			await Task.Delay(500, _cts.Token);
+			try {
+				await Task.Delay(500, _cts.Token);
+			} catch (TaskCanceledException _) {
+				break;
+			}
 		}
 	}
 
